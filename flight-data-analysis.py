@@ -1,75 +1,90 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import abs, unix_timestamp, stddev, when, count, avg, hour
+from pyspark.sql.types import StringType
+from pyspark.sql.functions import udf
 
-# Create a Spark session
-spark = SparkSession.builder.appName("Advanced Flight Data Analysis").getOrCreate()
+# Initialize Spark session
+spark = SparkSession.builder.appName("Flight Data Analysis").getOrCreate()
 
-# Load datasets
-flights_df = spark.read.csv("flights.csv", header=True, inferSchema=True)
-airports_df = spark.read.csv("airports.csv", header=True, inferSchema=True)
-carriers_df = spark.read.csv("carriers.csv", header=True, inferSchema=True)
+# Load the datasets
+flights = spark.read.csv("flights.csv", header=True, inferSchema=True)
+airports = spark.read.csv("airports.csv", header=True, inferSchema=True)
+carriers = spark.read.csv("carriers.csv", header=True, inferSchema=True)
 
-# Define output paths
-output_dir = "output/"
-task1_output = output_dir + "task1_largest_discrepancy.csv"
-task2_output = output_dir + "task2_consistent_airlines.csv"
-task3_output = output_dir + "task3_canceled_routes.csv"
-task4_output = output_dir + "task4_carrier_performance_time_of_day.csv"
+# Calculate dep_delay as the difference between ActualDeparture and ScheduledDeparture
+flights = flights.withColumn(
+    "dep_delay",
+    (unix_timestamp("ActualDeparture") - unix_timestamp("ScheduledDeparture")) / 60  # Convert seconds to minutes
+)
 
-# ------------------------
 # Task 1: Flights with the Largest Discrepancy Between Scheduled and Actual Travel Time
-# ------------------------
-def task1_largest_discrepancy(flights_df, carriers_df):
-    # TODO: Implement the SQL query for Task 1
-    # Hint: Calculate scheduled vs actual travel time, then find the largest discrepancies using window functions.
+flights.createOrReplaceTempView("flights")
+task1_query = """
+SELECT FlightNum, Origin, Destination,
+       ABS(UNIX_TIMESTAMP(ActualArrival) - UNIX_TIMESTAMP(ScheduledArrival)) AS discrepancy
+FROM flights
+ORDER BY discrepancy DESC
+LIMIT 10
+"""
+task1_result = spark.sql(task1_query)
+task1_result.write.mode("overwrite").csv("output/task1_largest_discrepancy.csv", header=True)
 
-    # Write the result to a CSV file
-    # Uncomment the line below after implementing the logic
-    # largest_discrepancy.write.csv(task1_output, header=True)
-    print(f"Task 1 output written to {task1_output}")
-
-# ------------------------
 # Task 2: Most Consistently On-Time Airlines Using Standard Deviation
-# ------------------------
-def task2_consistent_airlines(flights_df, carriers_df):
-    # TODO: Implement the SQL query for Task 2
-    # Hint: Calculate standard deviation of departure delays, filter airlines with more than 100 flights.
+task2_query = """
+SELECT CarrierCode, stddev(dep_delay) AS dep_delay_stddev
+FROM flights
+GROUP BY CarrierCode
+HAVING COUNT(*) > 100
+ORDER BY dep_delay_stddev ASC
+"""
+task2_result = spark.sql(task2_query)
+task2_result.write.mode("overwrite").csv("output/task2_consistent_airlines.csv", header=True)
 
-    # Write the result to a CSV file
-    # Uncomment the line below after implementing the logic
-    # consistent_airlines.write.csv(task2_output, header=True)
-    print(f"Task 2 output written to {task2_output}")
-
-# ------------------------
 # Task 3: Origin-Destination Pairs with the Highest Percentage of Canceled Flights
-# ------------------------
-def task3_canceled_routes(flights_df, airports_df):
-    # TODO: Implement the SQL query for Task 3
-    # Hint: Calculate cancellation rates for each route, then join with airports to get airport names.
+# Ensure `canceled` column exists and is properly represented (you may need to adapt based on actual column names)
+flights = flights.withColumn("canceled", when(flights["ActualDeparture"].isNull(), 1).otherwise(0))
+airports.createOrReplaceTempView("airports")
+flights.createOrReplaceTempView("flights")
 
-    # Write the result to a CSV file
-    # Uncomment the line below after implementing the logic
-    # canceled_routes.write.csv(task3_output, header=True)
-    print(f"Task 3 output written to {task3_output}")
+task3_query = """
+SELECT f.Origin, f.Destination,
+       a1.AirportName AS origin_name, a2.AirportName AS destination_name,
+       (SUM(CASE WHEN f.canceled = 1 THEN 1 ELSE 0 END) / COUNT(*)) * 100 AS cancellation_rate
+FROM flights f
+JOIN airports a1 ON f.Origin = a1.AirportCode
+JOIN airports a2 ON f.Destination = a2.AirportCode
+GROUP BY f.Origin, f.Destination, a1.AirportName, a2.AirportName
+ORDER BY cancellation_rate DESC
+LIMIT 10
+"""
+task3_result = spark.sql(task3_query)
+task3_result.write.mode("overwrite").csv("output/task3_canceled_routes.csv", header=True)
 
-# ------------------------
 # Task 4: Carrier Performance Based on Time of Day
-# ------------------------
-def task4_carrier_performance_time_of_day(flights_df, carriers_df):
-    # TODO: Implement the SQL query for Task 4
-    # Hint: Create time of day groups and calculate average delay for each carrier within each group.
+def time_of_day(dep_hour):
+    if 5 <= dep_hour < 12:
+        return "morning"
+    elif 12 <= dep_hour < 17:
+        return "afternoon"
+    elif 17 <= dep_hour < 21:
+        return "evening"
+    else:
+        return "night"
 
-    # Write the result to a CSV file
-    # Uncomment the line below after implementing the logic
-    # carrier_performance_time_of_day.write.csv(task4_output, header=True)
-    print(f"Task 4 output written to {task4_output}")
+time_of_day_udf = udf(time_of_day, StringType())
 
-# ------------------------
-# Call the functions for each task
-# ------------------------
-task1_largest_discrepancy(flights_df, carriers_df)
-task2_consistent_airlines(flights_df, carriers_df)
-task3_canceled_routes(flights_df, airports_df)
-task4_carrier_performance_time_of_day(flights_df, carriers_df)
+# Apply the UDF to classify time of day
+flights = flights.withColumn("time_of_day", time_of_day_udf(hour("ScheduledDeparture")))
+flights.createOrReplaceTempView("flights")
 
-# Stop the Spark session
+task4_query = """
+SELECT CarrierCode, time_of_day, AVG(dep_delay) AS avg_dep_delay
+FROM flights
+GROUP BY CarrierCode, time_of_day
+ORDER BY time_of_day, avg_dep_delay
+"""
+task4_result = spark.sql(task4_query)
+task4_result.write.mode("overwrite").csv("output/task4_carrier_performance_time_of_day.csv", header=True)
+
+# Stop Spark session
 spark.stop()
